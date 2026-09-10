@@ -1,0 +1,8 @@
+venv/
+.venv/
+
+__pycache__/
+*.pyc
+
+03_data/vocabulary.db
+03_data/progress.json

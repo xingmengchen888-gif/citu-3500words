@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>词途 · 高考3500词</title>
+</head>
+<body>
+  <div class="app">
+    <!-- 左侧导航栏 -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo"></div>
+        <div>
+          <h1>词途</h1>
+          <small>高考3500词</small>
+        </div>
+      </div>
+
+      <nav class="nav">
+
+          <button
+              class="active"
+              data-page="home"
+              onclick="navigatePage('home')"
+          >
+              <span>⌂</span>
+              首页
+          </button>
+
+          <button
+              data-page="study"
+              onclick="navigatePage('study')"
+          >
+              <span>▣</span>
+              学习
+          </button>
+
+          <button
+              data-page="review"
+              onclick="navigatePage('review')"
+          >
+              <span>◷</span>
+              复习
+          </button>
+
+          <button
+              data-page="words"
+              onclick="navigatePage('words')"
+          >
+              <span>▦</span>
+              词库
+          </button>
+
+          <button
+              data-page="wrong"
+              onclick="navigatePage('wrong')"
+          >
+              <span>▤</span>
+              错词本
+          </button>
+
+          <button
+              data-page="new"
+              onclick="navigatePage('new')"
+          >
+              <span>□</span>
+              生词本
+          </button>
+
+          <button
+              data-page="stats"
+              onclick="navigatePage('stats')"
+          >
+              <span>⌁</span>
+              统计
+          </button>
+
+          <button
+              data-page="settings"
+              onclick="navigatePage('settings')"
+          >
+              <span>⚙</span>
+              设置
+          </button>
+
+      </nav>
+
+      <div class="side-bottom">
+        已坚持学习<br>
+        <b>7</b> 天<br>
+        <small>累计学习 126 词</small>
+      </div>
+    </aside>
+
+    <!-- 主内容区域 -->
+    <main class="main">
+      <!-- 顶部栏 -->
+      <header class="topbar">
+        <button class="search">⌕</button>
+        <button class="check" onclick="toast('打卡成功！连续学习 8 天')">▣ 打卡</button>
+        <button class="avatar"></button>
+      </header>
+
+      <!-- Hero 横幅 -->
+      <section class="card hero">
+        <div class="eyebrow">高考3500词汇　⌄</div>
+        <h2>每日进步一点点<br>词汇提升看得见</h2>
+        <p>坚持学习，收获属于你的未来</p>
+        <div class="mountain"></div>
+      </section>
+
+      <!-- 学习进度 -->
+      <section class="card">
+
+          <div class="section-title">学习进度</div>
+
+          <div class="progress-row">
+
+              <div style="flex:1">
+
+                  <div class="progress-num">
+                      <span id="learned-count">0</span>
+                      <small>/ <span id="total-count">3500</span> 词</small>
+                  </div>
+
+                  <div class="bar">
+                      <i id="progress-bar"></i>
+                  </div>
+
+                  <div class="progress-meta">
+
+                      <span>
+                          已学 <span id="learned-count-2">0</span> 词
+                      </span>
+
+                      <span>
+                          剩余 <span id="remaining-count">0</span> 词
+                      </span>
+
+                  </div>
+
+              </div>
+
+
+              <div class="ring">
+
+                  <span id="progress-percentage">
+                      0%
+                      <small>完成度</small>
+                  </span>
+
+              </div>
+
+          </div>
+
+      </section>
+
+      <!-- 今日学习计划 -->
+      <section class="card">
+        <div class="section-title">
+          今日学习计划 
+          <button style="float:right;color:#7c879a;font-size:13px" onclick="toast('学习计划：新词30 + 复习45')">⚙ 调整计划</button>
+        </div>
+        <div class="plans">
+          <div class="plan">
+              <div>新学单词</div>
+
+              <div class="big">
+                  <span id="today-new-count">0</span>
+                  <small>词</small>
+              </div>
+
+              <button class="primary" onclick="startStudy('新词')">
+                  开始学习
+              </button>
+          </div>
+          <div class="plan">
+              <div>复习单词</div>
+
+              <div class="big">
+                  <span id="today-review-count">0</span>
+                  <small>词</small>
+              </div>
+
+              <button class="outline" onclick="startStudy('复习')">
+                  开始复习
+              </button>
+          </div>
+          <div class="plan">
+            <div>◷ 预计用时</div>
+            <div style="font-size:20px;margin:9px 0 18px">20 分钟</div>
+            <div>◷ 今日目标</div>
+            <div style="font-size:20px;margin-top:9px">75 词</div>
+          </div>
+        </div>
+      </section>
+      <!-- 今日学习进度 -->
+      <section class="card today-progress-card">
+
+          <div class="section-title">
+              今日学习进度
+          </div>
+
+          <div class="today-progress-row">
+
+              <div class="today-progress-item">
+                  <div class="today-label">
+                      新词
+                  </div>
+
+                  <div class="today-number">
+                      <span id="today-new-completed">0</span>
+                      /
+                      <span id="today-new-total">0</span>
+                  </div>
+              </div>
+
+
+              <div class="today-progress-item">
+                  <div class="today-label">
+                      复习
+                  </div>
+
+                  <div class="today-number">
+                      <span id="today-review-completed">0</span>
+                      /
+                      <span id="today-review-total">0</span>
+                  </div>
+              </div>
+
+
+              <div class="today-progress-item">
+
+                  <div class="today-label">
+                      今日完成
+                  </div>
+
+                  <div class="today-number">
+                      <span id="today-total-completed">0</span>
+                      /
+                      <span id="today-total-target">0</span>
+                  </div>
+
+              </div>
+
+          </div>
+
+
+          <div class="today-progress-bar">
+              <i id="today-progress-fill"></i>
+          </div>
+
+
+          <div class="today-progress-percent">
+              <span id="today-progress-percentage">
+                  0%
+              </span>
+          </div>
+
+      </section>
+      <!-- 学习工具 -->
+      <section class="card">
+        <div class="section-title">学习工具</div>
+        <div class="tools">
+          <button class="tool" onclick="toast('开始单词自检')">
+            <span class="icon">▣</span>
+            <span><b>单词自检</b><small>检测掌握程度</small></span>
+          </button>
+          <button class="tool" onclick="toast('听力训练已准备')">
+            <span class="icon">◉</span>
+            <span><b>听力训练</b><small>听力巩固记忆</small></span>
+          </button>
+          <button class="tool" onclick="toast('拼写训练已准备')">
+            <span class="icon">⌨</span>
+            <span><b>拼写训练</b><small>拼写巩固记忆</small></span>
+          </button>
+          <button class="tool" onclick="toast('词汇测试已准备')">
+            <span class="icon">✎</span>
+            <span><b>词汇测试</b><small>检测学习成果</small></span>
+          </button>
+        </div>
+      </section>
+
+      <!-- 学习记录图表 -->
+      <section class="card">
+        <div class="section-title">
+          学习记录 
+          <button style="float:right;border:1px solid var(--line);padding:6px 10px;border-radius:8px;color:#6e7a90">近7天⌄</button>
+        </div>
+        <div class="chart">
+          <div class="barcol"><i style="height:74px"></i><small>05-10</small></div>
+          <div class="barcol"><i style="height:86px"></i><small>05-11</small></div>
+          <div class="barcol"><i style="height:94px"></i><small>05-12</small></div>
+          <div class="barcol"><i style="height:103px"></i><small>05-13</small></div>
+          <div class="barcol"><i style="height:88px"></i><small>05-14</small></div>
+          <div class="barcol"><i style="height:105px"></i><small>05-15</small></div>
+          <div class="barcol active"><i style="height:126px"></i><small>05-16</small></div>
+        </div>
+      </section>
+
+      <!-- 励志语录 -->
+      <section class="card quote">
+        <strong>" 往死里学，学不死就行"</strong>
+        <p>—— 坚持下去，你一定可以！</p>
+        <div class="book">⌑</div>
+      </section>
+    </main>
+  </div>
+
+  <!-- 提示消息 -->
+  <div class="toast" id="toast"></div>
+
+  <script src="{{ url_for('static', filename='script.js') }}"></script>
+  <script>
+    function toast(t) {
+      const el = document.getElementById('toast');
+      el.textContent = t;
+      el.classList.add('show');
+      clearTimeout(window.tt);
+      window.tt = setTimeout(() => {
+        el.classList.remove('show');
+      }, 1800);
+    }
+  </script>
+</body>
+</html>
