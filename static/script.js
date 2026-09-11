@@ -309,7 +309,7 @@ function showCompletePage() {
             <p>
                 你今天完成了
                 <strong>${words.length}</strong>
-                个新单词。
+                个${currentStudyType === "复习" ? "复习单词" : "新单词"}。
             </p>
 
             <p style="color:var(--muted); margin-top:8px;">
@@ -489,6 +489,8 @@ async function reviewWrongWord(wordId) {
 
         // 当前只复习这一个词
 
+        currentStudyType = "复习";
+
         words = [word];
 
         currentIndex = 0;
@@ -661,6 +663,14 @@ document.addEventListener(
         loadTodayPlan();
 
         loadTodayProgress();
+
+        const initialPage = new URLSearchParams(
+            window.location.search
+        ).get("page");
+
+        if (initialPage && initialPage !== "home") {
+            navigatePage(initialPage);
+        }
 
     }
 );
@@ -1097,6 +1107,7 @@ function setActiveNav(page) {
 
 function navigatePage(page) {
 
+    closeWordBookModal();
 
     // ------------------------------
     // 首页
@@ -1148,6 +1159,9 @@ function navigatePage(page) {
 
         setActiveNav("wrong");
 
+        words = [];
+        currentIndex = 0;
+
         showWrongWords();
 
         return;
@@ -1161,6 +1175,9 @@ function navigatePage(page) {
     if (page === "stats") {
 
         setActiveNav("stats");
+
+        words = [];
+        currentIndex = 0;
 
         showStatistics();
 
@@ -1176,7 +1193,10 @@ function navigatePage(page) {
 
         setActiveNav("words");
 
-        toast("词库功能下一步开放");
+        words = [];
+        currentIndex = 0;
+
+        showWordLibrary(1);
 
         return;
     }
@@ -1189,6 +1209,9 @@ function navigatePage(page) {
     if (page === "new") {
 
         setActiveNav("new");
+
+        words = [];
+        currentIndex = 0;
 
         toast("生词本功能下一步开放");
 
@@ -1204,9 +1227,853 @@ function navigatePage(page) {
 
         setActiveNav("settings");
 
+        words = [];
+        currentIndex = 0;
+
         toast("设置功能下一步开放");
 
         return;
     }
 
+}
+
+// ========================================
+// 词库：搜索、筛选、分页和详情
+// ========================================
+
+const libraryState = {
+    page: 1,
+    query: "",
+    status: "all",
+    words: [],
+    wordbook: null,
+    wordbooks: []
+};
+
+const wordStatusLabels = {
+    new: "未学习",
+    learning: "学习中",
+    mastered: "已掌握",
+    wrong: "错词"
+};
+
+function escapeHTML(value) {
+
+    return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}
+
+function formatWordHTML(value) {
+
+    return escapeHTML(value || "")
+        .replace(/\n/g, "<br>");
+}
+
+function getMeaningPreview(value) {
+
+    const lines = String(value || "")
+        .split("\n")
+        .map(line => line.trim())
+        .filter(Boolean);
+
+    const preview = lines
+        .slice(0, 2)
+        .map(line => escapeHTML(line))
+        .join("<br>");
+
+    return preview || "暂无释义";
+}
+
+function getWordStatusLabel(status) {
+
+    return wordStatusLabels[status] || status || "未学习";
+}
+
+function renderLibraryPagination(page, pages) {
+
+    if (pages <= 1) {
+        return "";
+    }
+
+    return `
+        <div class="library-pagination">
+
+            <button
+                class="outline"
+                ${page <= 1 ? "disabled" : ""}
+                onclick="showWordLibrary(${page - 1})"
+            >
+                上一页
+            </button>
+
+            <span>
+                第 ${page} / ${pages} 页
+            </span>
+
+            <button
+                class="outline"
+                ${page >= pages ? "disabled" : ""}
+                onclick="showWordLibrary(${page + 1})"
+            >
+                下一页
+            </button>
+
+        </div>
+    `;
+}
+
+function renderWordLibrary(data) {
+
+    libraryState.words = data.words || [];
+    libraryState.wordbook = data.wordbook || null;
+    libraryState.wordbooks = data.wordbooks || [];
+
+    const listHTML = libraryState.words.length
+        ? libraryState.words.map(word => {
+
+            const status = word.progress_status || "new";
+
+            const phonetic = word.phonetic
+                ? `<span class="library-phonetic">${escapeHTML(word.phonetic)}</span>`
+                : "";
+
+            const pos = word.pos
+                ? `<span class="library-pos">${escapeHTML(word.pos)}</span>`
+                : "";
+
+            const tags = word.tag
+                ? `<div class="library-detail-line"><b>标签</b>${escapeHTML(word.tag)}</div>`
+                : "";
+
+            const exchange = word.exchange
+                ? `<div class="library-detail-line"><b>词形</b>${escapeHTML(word.exchange)}</div>`
+                : "";
+
+            const definition = word.definition
+                ? `<div class="library-detail-section"><b>英文释义</b><div>${formatWordHTML(word.definition)}</div></div>`
+                : "";
+
+            return `
+                <article class="library-word-item status-${escapeHTML(status)}">
+
+                    <div class="library-word-main">
+
+                        <div class="library-word-heading">
+                            <strong>${escapeHTML(word.word)}</strong>
+                            ${phonetic}
+                            ${pos}
+                        </div>
+
+                        <div class="library-meaning">
+                            ${getMeaningPreview(word.meaning)}
+                        </div>
+
+                    </div>
+
+                    <div class="library-word-side">
+
+                        <span class="library-status status-${escapeHTML(status)}">
+                            ${escapeHTML(getWordStatusLabel(status))}
+                        </span>
+
+                        <button
+                            class="outline library-icon-btn"
+                            onclick="speakLibraryWord(${word.id})"
+                            title="播放发音"
+                        >
+                            🔊
+                        </button>
+
+                        <button
+                            class="outline library-icon-btn"
+                            onclick="toggleWordDetail(${word.id})"
+                        >
+                            详情
+                        </button>
+
+                    </div>
+
+                </article>
+
+                <div
+                    class="library-detail"
+                    id="library-detail-${word.id}"
+                    hidden
+                >
+
+                    <div class="library-detail-section">
+                        <b>中文释义</b>
+                        <div>${formatWordHTML(word.translation || word.meaning)}</div>
+                    </div>
+
+                    ${definition}
+
+                    <div class="library-detail-meta">
+
+                        ${tags}
+                        ${exchange}
+
+                        <div class="library-detail-line">
+                            <b>学习状态</b>
+                            等级 ${word.level || 0}
+                            · 认识 ${word.correct_count || 0}
+                            · 错误 ${word.wrong_count || 0}
+                            ${word.next_review ? ` · 下次复习 ${escapeHTML(word.next_review)}` : ""}
+                        </div>
+
+                    </div>
+
+                </div>
+            `;
+
+        }).join("")
+        : `
+            <div class="library-empty">
+                <strong>没有找到匹配的单词</strong>
+                <p>可以换个关键词或切换筛选条件。</p>
+            </div>
+        `;
+
+    const wordbookOptions = libraryState.wordbooks.map(book => `
+        <option
+            value="${book.id}"
+            ${libraryState.wordbook && libraryState.wordbook.id === book.id ? "selected" : ""}
+        >
+            ${escapeHTML(book.name)}（${book.word_count} 词）
+        </option>
+    `).join("");
+
+    const statusOptions = [
+        ["all", "全部"],
+        ["new", "未学习"],
+        ["learning", "学习中"],
+        ["mastered", "已掌握"],
+        ["wrong", "错词"]
+    ].map(([value, label]) => `
+        <option
+            value="${value}"
+            ${libraryState.status === value ? "selected" : ""}
+        >
+            ${label}
+        </option>
+    `).join("");
+
+    const activeWordBookName = libraryState.wordbook
+        ? escapeHTML(libraryState.wordbook.name)
+        : "未选择词书";
+
+    document.querySelector(".main").innerHTML = `
+
+        <div class="card library-page">
+
+            <div class="library-header">
+
+                <div>
+                    <div class="section-title">词库</div>
+                    <div class="library-count">
+                        筛选结果 ${data.total} 个词
+                        <span>·</span>
+                        当前 ${activeWordBookName}
+                        <span>·</span>
+                        ${libraryState.wordbook ? libraryState.wordbook.word_count : 0} 词
+                    </div>
+                </div>
+
+                <div class="library-source">
+                    ECDICT · 自定义词书
+                </div>
+
+            </div>
+
+            <div class="library-toolbar">
+
+                <div class="library-book-row">
+
+                    <span class="library-toolbar-label">
+                        当前词书
+                    </span>
+
+                    <select
+                        id="library-wordbook-select"
+                        class="outline"
+                        onchange="switchWordBook(this.value)"
+                    >
+                        ${wordbookOptions}
+                    </select>
+
+                    <button
+                        class="outline library-toolbar-btn"
+                        onclick="openWordBookModal()"
+                    >
+                        新建词书
+                    </button>
+
+                    <button
+                        class="outline library-toolbar-btn"
+                        onclick="editCurrentWordBook()"
+                    >
+                        编辑当前
+                    </button>
+
+                </div>
+
+                <div class="library-filter-row">
+
+                    <div class="library-search">
+                        <input
+                            id="library-search-input"
+                            type="search"
+                            value="${escapeHTML(libraryState.query)}"
+                            placeholder="搜索单词、中文释义或标签"
+                        >
+
+                        <button
+                            class="primary"
+                            onclick="searchWordLibrary()"
+                        >
+                            搜索
+                        </button>
+                    </div>
+
+                    <select
+                        id="library-status-select"
+                        class="outline"
+                        onchange="searchWordLibrary()"
+                    >
+                        ${statusOptions}
+                    </select>
+
+                </div>
+
+            </div>
+
+            <div class="library-list">
+                ${listHTML}
+            </div>
+
+            ${renderLibraryPagination(data.page, data.pages)}
+
+        </div>
+    `;
+
+    const searchInput = document.getElementById(
+        "library-search-input"
+    );
+
+    if (searchInput) {
+
+        searchInput.addEventListener("keydown", function(event) {
+
+            if (event.key === "Enter") {
+
+                searchWordLibrary();
+
+            }
+
+        });
+
+    }
+}
+
+async function showWordLibrary(page = 1) {
+
+    setActiveNav("words");
+
+    try {
+
+        const params = new URLSearchParams({
+            page: String(page),
+            per_page: "40",
+            status: libraryState.status
+        });
+
+        if (libraryState.query) {
+
+            params.set("q", libraryState.query);
+
+        }
+
+        const response = await fetch(
+            `/api/library?${params.toString()}`
+        );
+
+        const data = await response.json();
+
+        if (!data.success) {
+
+            throw new Error(data.message || "加载词库失败");
+
+        }
+
+        libraryState.page = data.page;
+
+        renderWordLibrary(data);
+
+    } catch (error) {
+
+        console.error(error);
+
+        alert("加载词库失败，请检查后端是否正在运行");
+
+    }
+}
+
+function searchWordLibrary() {
+
+    const input = document.getElementById(
+        "library-search-input"
+    );
+
+    const select = document.getElementById(
+        "library-status-select"
+    );
+
+    libraryState.query = input
+        ? input.value.trim()
+        : "";
+
+    libraryState.status = select
+        ? select.value
+        : "all";
+
+    showWordLibrary(1);
+}
+
+function speakLibraryWord(wordId) {
+
+    const word = libraryState.words.find(
+        item => item.id === wordId
+    );
+
+    if (word) {
+
+        speakWord(word.word);
+
+    }
+}
+
+function toggleWordDetail(wordId) {
+
+    const detail = document.getElementById(
+        `library-detail-${wordId}`
+    );
+
+    if (detail) {
+
+        detail.hidden = !detail.hidden;
+
+    }
+}
+
+// ========================================
+// 自定义词书
+// ========================================
+
+let editingWordBookId = null;
+
+async function switchWordBook(bookId) {
+
+    bookId = Number(bookId);
+
+    if (
+        !bookId ||
+        (libraryState.wordbook && libraryState.wordbook.id === bookId)
+    ) {
+        return;
+    }
+
+    const select = document.getElementById(
+        "library-wordbook-select"
+    );
+
+    if (select) {
+        select.disabled = true;
+    }
+
+    toast("正在切换词书...");
+
+    try {
+
+        const response = await fetch(
+            `/api/wordbooks/${bookId}/activate`,
+            { method: "POST" }
+        );
+
+        const data = await response.json();
+
+        if (!data.success) {
+            throw new Error(data.message || "切换词书失败");
+        }
+
+        libraryState.query = "";
+        libraryState.status = "all";
+
+        await showWordLibrary(1);
+
+    } catch (error) {
+
+        console.error(error);
+        alert(error.message || "切换词书失败");
+
+        if (select) {
+            select.disabled = false;
+
+            if (libraryState.wordbook) {
+                select.value = String(libraryState.wordbook.id);
+            }
+        }
+    }
+}
+
+function editCurrentWordBook() {
+
+    if (!libraryState.wordbook) {
+        return;
+    }
+
+    if (libraryState.wordbook.is_system) {
+        toast("默认词书请直接编辑 03_data/wordlist.txt");
+        return;
+    }
+
+    openWordBookModal(libraryState.wordbook.id);
+}
+
+async function openWordBookModal(bookId = null) {
+
+    closeWordBookModal();
+
+    editingWordBookId = bookId ? Number(bookId) : null;
+
+    let name = "";
+    let words = "";
+    let wordCount = 0;
+
+    if (editingWordBookId) {
+
+        try {
+
+            const response = await fetch(
+                `/api/wordbooks/${editingWordBookId}`
+            );
+
+            const data = await response.json();
+
+            if (!data.success) {
+                throw new Error(data.message || "加载词书失败");
+            }
+
+            name = data.wordbook.name || "";
+            words = data.wordbook.words || "";
+            wordCount = data.wordbook.word_count || 0;
+
+        } catch (error) {
+
+            console.error(error);
+            alert(error.message || "加载词书失败");
+            return;
+        }
+    }
+
+    const title = editingWordBookId
+        ? "编辑自定义词书"
+        : "新建自定义词书";
+
+    const deleteButton = editingWordBookId
+        ? `
+            <button
+                class="outline danger"
+                onclick="deleteCurrentWordBook()"
+            >
+                删除词书
+            </button>
+        `
+        : "";
+
+    document.body.insertAdjacentHTML(
+        "beforeend",
+        `
+            <div
+                class="wordbook-modal-backdrop"
+                onclick="handleWordBookBackdrop(event)"
+            >
+
+                <div class="wordbook-modal">
+
+                    <div class="wordbook-modal-header">
+
+                        <div>
+                            <h2>${title}</h2>
+                            <p>一行一个单词，支持直接粘贴或导入 txt 文件。</p>
+                        </div>
+
+                        <button
+                            class="wordbook-modal-close"
+                            onclick="closeWordBookModal()"
+                        >
+                            ×
+                        </button>
+
+                    </div>
+
+                    <label class="wordbook-field">
+                        <span>词书名称</span>
+                        <input
+                            id="wordbook-name-input"
+                            type="text"
+                            maxlength="40"
+                            value="${escapeHTML(name)}"
+                            placeholder="例如：雅思核心词"
+                        >
+                    </label>
+
+                    <label class="wordbook-field">
+                        <span>
+                            单词列表
+                            ${wordCount ? `<small>当前 ${wordCount} 词</small>` : ""}
+                        </span>
+
+                        <textarea
+                            id="wordbook-words-input"
+                            placeholder="abandon&#10;ability&#10;able"
+                        >${escapeHTML(words)}</textarea>
+                    </label>
+
+                    <label class="wordbook-file">
+                        <input
+                            id="wordbook-file-input"
+                            type="file"
+                            accept=".txt,text/plain"
+                            onchange="loadWordBookFile(event)"
+                        >
+                        <span>选择 txt 文件</span>
+                    </label>
+
+                    <div class="wordbook-modal-actions">
+
+                        <div>${deleteButton}</div>
+
+                        <div class="wordbook-modal-primary-actions">
+
+                            <button
+                                class="outline"
+                                onclick="closeWordBookModal()"
+                            >
+                                取消
+                            </button>
+
+                            <button
+                                class="primary"
+                                id="wordbook-save-button"
+                                onclick="saveWordBook()"
+                            >
+                                保存并启用
+                            </button>
+
+                        </div>
+
+                    </div>
+
+                </div>
+
+            </div>
+        `
+    );
+
+    document.body.classList.add("modal-open");
+
+    const nameInput = document.getElementById(
+        "wordbook-name-input"
+    );
+
+    if (nameInput) {
+        nameInput.focus();
+    }
+}
+
+function closeWordBookModal() {
+
+    const modal = document.querySelector(
+        ".wordbook-modal-backdrop"
+    );
+
+    if (modal) {
+        modal.remove();
+    }
+
+    document.body.classList.remove("modal-open");
+    editingWordBookId = null;
+}
+
+function handleWordBookBackdrop(event) {
+
+    if (event.target.classList.contains("wordbook-modal-backdrop")) {
+        closeWordBookModal();
+    }
+}
+
+function loadWordBookFile(event) {
+
+    const file = event.target.files
+        ? event.target.files[0]
+        : null;
+
+    if (!file) {
+        return;
+    }
+
+    const reader = new FileReader();
+
+    reader.onload = function() {
+
+        const textarea = document.getElementById(
+            "wordbook-words-input"
+        );
+
+        if (textarea) {
+            textarea.value = String(reader.result || "");
+        }
+    };
+
+    reader.onerror = function() {
+        alert("读取 txt 文件失败");
+    };
+
+    reader.readAsText(file, "UTF-8");
+}
+
+async function saveWordBook() {
+
+    const nameInput = document.getElementById(
+        "wordbook-name-input"
+    );
+
+    const wordsInput = document.getElementById(
+        "wordbook-words-input"
+    );
+
+    const saveButton = document.getElementById(
+        "wordbook-save-button"
+    );
+
+    const name = nameInput
+        ? nameInput.value.trim()
+        : "";
+
+    const words = wordsInput
+        ? wordsInput.value
+        : "";
+
+    if (!name) {
+        alert("请输入词书名称");
+        return;
+    }
+
+    if (!words.trim()) {
+        alert("词书至少需要一个单词");
+        return;
+    }
+
+    if (saveButton) {
+        saveButton.disabled = true;
+        saveButton.textContent = "正在保存...";
+    }
+
+    const url = editingWordBookId
+        ? `/api/wordbooks/${editingWordBookId}`
+        : "/api/wordbooks";
+
+    const method = editingWordBookId
+        ? "PUT"
+        : "POST";
+
+    try {
+
+        const response = await fetch(url, {
+
+            method: method,
+
+            headers: {
+                "Content-Type": "application/json"
+            },
+
+            body: JSON.stringify({
+                name: name,
+                words: words
+            })
+
+        });
+
+        const data = await response.json();
+
+        if (!data.success) {
+            throw new Error(data.message || "保存词书失败");
+        }
+
+        closeWordBookModal();
+
+        libraryState.query = "";
+        libraryState.status = "all";
+
+        toast(data.message || "词书已保存");
+
+        await showWordLibrary(1);
+
+    } catch (error) {
+
+        console.error(error);
+        alert(error.message || "保存词书失败");
+
+        if (saveButton) {
+            saveButton.disabled = false;
+            saveButton.textContent = "保存并启用";
+        }
+    }
+}
+
+async function deleteCurrentWordBook() {
+
+    if (!editingWordBookId) {
+        return;
+    }
+
+    const confirmed = confirm(
+        "确定删除这个词书吗？词书本身会删除，单词的全局学习记录会保留。"
+    );
+
+    if (!confirmed) {
+        return;
+    }
+
+    try {
+
+        const response = await fetch(
+            `/api/wordbooks/${editingWordBookId}`,
+            { method: "DELETE" }
+        );
+
+        const data = await response.json();
+
+        if (!data.success) {
+            throw new Error(data.message || "删除词书失败");
+        }
+
+        closeWordBookModal();
+
+        libraryState.query = "";
+        libraryState.status = "all";
+
+        toast(data.message || "词书已删除");
+
+        await showWordLibrary(1);
+
+    } catch (error) {
+
+        console.error(error);
+        alert(error.message || "删除词书失败");
+    }
 }

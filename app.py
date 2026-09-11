@@ -1,6 +1,9 @@
 from flask import Flask, render_template, jsonify, request
-import json
+import csv
+import hashlib
+import re
 import sqlite3
+import unicodedata
 from pathlib import Path
 from datetime import date, timedelta
 
@@ -15,9 +18,9 @@ BASE_DIR = Path(__file__).resolve().parent
 
 DATA_DIR = BASE_DIR / "03_data"
 
-WORDS_FILE = DATA_DIR / "words.json"
-PROGRESS_FILE = DATA_DIR / "progress.json"
 DB_FILE = DATA_DIR / "vocabulary.db"
+WORD_LIST_FILE = DATA_DIR / "wordlist.txt"
+ECDICT_CSV_FILE = DATA_DIR / "ecdict.csv"
 
 
 # =========================================================
@@ -58,7 +61,34 @@ def init_database():
             meaning TEXT,
             example TEXT,
             example_cn TEXT,
-            level TEXT
+            level TEXT,
+            definition TEXT,
+            translation TEXT,
+            exchange TEXT,
+            tag TEXT,
+            bnc INTEGER DEFAULT 0,
+            frq INTEGER DEFAULT 0,
+            collins INTEGER DEFAULT 0,
+            oxford INTEGER DEFAULT 0,
+            detail TEXT,
+            audio TEXT,
+            matched_word TEXT,
+            in_ecdict INTEGER DEFAULT 0
+        )
+    """)
+
+    # -----------------------------------------------------
+    # 词书表
+    # -----------------------------------------------------
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS word_books (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            words TEXT NOT NULL,
+            is_system INTEGER DEFAULT 0,
+            created_at TEXT,
+            updated_at TEXT
         )
     """)
 
@@ -77,6 +107,20 @@ def init_database():
             learned INTEGER DEFAULT 0,
             in_wrong INTEGER DEFAULT 0,
             FOREIGN KEY (word_id) REFERENCES words(id)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS progress_store (
+            word_key TEXT PRIMARY KEY,
+            word TEXT NOT NULL,
+            level INTEGER DEFAULT 0,
+            last_review TEXT,
+            next_review TEXT,
+            correct_count INTEGER DEFAULT 0,
+            wrong_count INTEGER DEFAULT 0,
+            learned INTEGER DEFAULT 0,
+            in_wrong INTEGER DEFAULT 0
         )
     """)
     # -----------------------------------------------------
@@ -152,175 +196,450 @@ def init_database():
             ADD COLUMN in_wrong INTEGER DEFAULT 0
         """)
 
+    # -----------------------------------------------------
+    # 兼容旧版 words 表，补充 ECDICT 字段
+    # -----------------------------------------------------
+
+    cursor.execute("""
+        PRAGMA table_info(words)
+    """)
+
+    word_columns = {
+        row["name"]
+        for row in cursor.fetchall()
+    }
+
+    ecdict_word_columns = {
+        "definition": "TEXT",
+        "translation": "TEXT",
+        "exchange": "TEXT",
+        "tag": "TEXT",
+        "bnc": "INTEGER DEFAULT 0",
+        "frq": "INTEGER DEFAULT 0",
+        "collins": "INTEGER DEFAULT 0",
+        "oxford": "INTEGER DEFAULT 0",
+        "detail": "TEXT",
+        "audio": "TEXT",
+        "matched_word": "TEXT",
+        "in_ecdict": "INTEGER DEFAULT 0"
+    }
+
+    for column_name, column_type in ecdict_word_columns.items():
+
+        if column_name not in word_columns:
+
+            cursor.execute(
+                f"ALTER TABLE words "
+                f"ADD COLUMN {column_name} {column_type}"
+            )
+
+    sync_progress_store(cursor)
+
     conn.commit()
 
     conn.close()
 
 
 # =========================================================
-# JSON → SQLite 第一次迁移
+# 自定义词表 + ECDICT 导入
 #
-# 只执行一次。
-# 第一次运行时，以当前 JSON 数据为准。
-# 以后正式使用 SQLite。
+# wordlist.txt 决定要学习的单词及顺序。
+# ecdict.csv 提供音标、中英释义、词形变化等词典数据。
 # =========================================================
 
-def migrate_json_to_database():
 
-    conn = get_db()
+ECDICT_ALIASES = {
+    "relevent": "relevant",
+    "sideroad": "side road",
+    "mosquiton": "mosquito"
+}
 
-    cursor = conn.cursor()
+
+def normalize_word_key(value):
+
+    text = unicodedata.normalize(
+        "NFKC",
+        str(value or "")
+    )
+
+    text = text.strip().lower().replace(
+        "’",
+        "'"
+    )
+
+    return re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
+
+def compact_word_key(value):
+
+    return re.sub(
+        r"[^a-z0-9]+",
+        "",
+        normalize_word_key(value)
+    )
+
+
+def word_lookup_keys(value):
+
+    normalized = normalize_word_key(value)
+
+    aliased = ECDICT_ALIASES.get(
+        normalized,
+        normalized
+    )
+
+    keys = [
+        normalized,
+        aliased,
+        compact_word_key(normalized),
+        compact_word_key(aliased)
+    ]
+
+    return [
+        key
+        for key in dict.fromkeys(keys)
+        if key
+    ]
+
+
+def clean_wordlist_entry(value):
+    """兼容旧 words.json 中混入的词性、编号和乱码。"""
+
+    text = unicodedata.normalize(
+        "NFKC",
+        str(value or "").strip()
+    )
+
+    text = re.sub(
+        r"\s*[（(].*$",
+        "",
+        text
+    )
+
+    text = re.sub(
+        r"(?<=\D)\d+",
+        " ",
+        text
+    )
+
+    text = re.sub(
+        r"[^\x00-\x7F]+.*$",
+        "",
+        text
+    )
+
+    text = re.sub(
+        r"[^A-Za-z\s.'-]+.*$",
+        "",
+        text
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    ).strip(" .")
+
+    text = re.sub(
+        r"\s+(?:n|v|vi|vt|adj|adv|prep|pron|conj|num|art|modal|aux|int)\.?$",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    return text.strip(" .")
+
+
+def legacy_word_lookup_keys(value):
+
+    return word_lookup_keys(
+        clean_wordlist_entry(value)
+    )
+
+
+def clean_ecdict_text(value):
+
+    text = str(value or "")
+
+    text = text.replace(
+        "\\r\\n",
+        "\n"
+    ).replace(
+        "\\n",
+        "\n"
+    ).replace(
+        "\r\n",
+        "\n"
+    )
+
+    return text.strip()
+
+
+def derive_pos(translation, row_pos=""):
+
+    if str(row_pos or "").strip():
+
+        return str(row_pos).strip()
+
+    labels = {
+        "n": "n.",
+        "v": "v.",
+        "vi": "vi.",
+        "vt": "vt.",
+        "a": "adj.",
+        "adj": "adj.",
+        "ad": "adv.",
+        "adv": "adv.",
+        "prep": "prep.",
+        "pron": "pron.",
+        "conj": "conj.",
+        "num": "num.",
+        "art": "art.",
+        "aux": "aux.",
+        "modal": "modal"
+    }
+
+    result = []
+
+    for match in re.finditer(
+        r"(?m)^\s*([A-Za-z]+)\.",
+        translation or ""
+    ):
+
+        key = match.group(1).lower()
+
+        if key in labels and labels[key] not in result:
+
+            result.append(labels[key])
+
+    return " ".join(result)
+
+
+def to_int(value, default=0):
+
+    try:
+
+        return int(value)
+
+    except (TypeError, ValueError):
+
+        return default
+
+
+def ecdict_match_score(custom_word, row):
+
+    row_word = row.get("word", "")
+
+    return (
+        1 if normalize_word_key(row_word) == normalize_word_key(custom_word) else 0,
+        1 if compact_word_key(row_word) == compact_word_key(custom_word) else 0,
+        1 if clean_ecdict_text(row.get("translation")) else 0,
+        1 if clean_ecdict_text(row.get("definition")) else 0,
+        1 if clean_ecdict_text(row.get("phonetic")) else 0,
+        1 if clean_ecdict_text(row.get("tag")) else 0
+    )
+
+
+def normalize_word_list(raw_words, max_words=20000):
+    """清理词表：忽略空行/注释，按大小写不敏感去重。"""
+
+    if isinstance(raw_words, str):
+        lines = raw_words.splitlines()
+    else:
+        lines = list(raw_words or [])
+
+    words = []
+    seen = set()
+
+    for raw_word in lines:
+
+        word = str(raw_word or "").strip()
+
+        if not word or word.startswith("#"):
+            continue
+
+        word = unicodedata.normalize("NFKC", word)
+        key = normalize_word_key(word)
+
+        if not key or key in seen:
+            continue
+
+        seen.add(key)
+        words.append(word)
+
+        if len(words) > max_words:
+            raise ValueError(f"词书最多支持 {max_words} 个单词")
+
+    return words
+
+
+def serialize_word_list(words):
+
+    return "\n".join(words) + "\n"
+
+
+def read_custom_wordlist():
+
+    if not WORD_LIST_FILE.exists():
+        raise FileNotFoundError(f"找不到自定义词表：{WORD_LIST_FILE}")
+
+    words = normalize_word_list(
+        WORD_LIST_FILE.read_text(encoding="utf-8-sig")
+    )
+
+    if not words:
+        raise ValueError(f"自定义词表为空：{WORD_LIST_FILE}")
+
+    return words
+
+
+def get_active_word_book(cursor):
 
     cursor.execute("""
-        SELECT value
-        FROM app_meta
-        WHERE key = 'json_migration_done'
+        SELECT
+            b.id,
+            b.name,
+            b.words,
+            b.is_system,
+            b.created_at,
+            b.updated_at
+        FROM word_books b
+        INNER JOIN app_meta meta
+            ON CAST(b.id AS TEXT) = meta.value
+        WHERE meta.key = 'active_word_book_id'
+        LIMIT 1
     """)
 
     row = cursor.fetchone()
 
-    # 已经迁移过，就不再重复迁移
-    if row and row["value"] == "1":
-
-        conn.close()
-
-        return
-
-    # -----------------------------------------------------
-    # 读取 words.json
-    # -----------------------------------------------------
-
-    if WORDS_FILE.exists():
-
-        with open(
-            WORDS_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            words = json.load(f)
-
-    else:
-
-        words = []
-
-    # -----------------------------------------------------
-    # 读取 progress.json
-    # -----------------------------------------------------
-
-    if PROGRESS_FILE.exists():
-
-        with open(
-            PROGRESS_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            progress = json.load(f)
-
-    else:
-
-        progress = {
-            "learned_ids": [],
-            "wrong_ids": [],
-            "total_studied": 0,
-            "word_progress": {}
-        }
-
-    learned_ids = set(
-        progress.get("learned_ids", [])
-    )
-
-    wrong_ids = set(
-        progress.get("wrong_ids", [])
-    )
-
-    word_progress = progress.get(
-        "word_progress",
-        {}
-    )
-
-    # -----------------------------------------------------
-    # 清理旧数据库中的数据
-    #
-    # 因为这是第一次迁移，
-    # 当前 JSON 才是最新数据。
-    # -----------------------------------------------------
+    if row is not None:
+        return row
 
     cursor.execute("""
-        DELETE FROM word_progress
+        SELECT
+            id,
+            name,
+            words,
+            is_system,
+            created_at,
+            updated_at
+        FROM word_books
+        WHERE is_system = 1
+        ORDER BY id
+        LIMIT 1
     """)
+
+    row = cursor.fetchone()
+
+    if row is None:
+        raise RuntimeError("数据库中没有可用词书")
 
     cursor.execute("""
-        DELETE FROM words
+        INSERT OR REPLACE INTO app_meta (key, value)
+        VALUES ('active_word_book_id', ?)
+    """, (str(row["id"]),))
+
+    return row
+
+
+def get_word_book(cursor, book_id):
+
+    cursor.execute("""
+        SELECT
+            id,
+            name,
+            words,
+            is_system,
+            created_at,
+            updated_at
+        FROM word_books
+        WHERE id = ?
+    """, (book_id,))
+
+    return cursor.fetchone()
+
+
+def word_book_to_dict(row, active_book_id=None, include_words=False):
+
+    words = normalize_word_list(row["words"])
+
+    result = {
+        "id": row["id"],
+        "name": row["name"],
+        "word_count": len(words),
+        "is_system": bool(row["is_system"]),
+        "active": row["id"] == active_book_id,
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"]
+    }
+
+    if include_words:
+        result["words"] = serialize_word_list(words)
+
+    return result
+
+
+def list_word_books(cursor):
+
+    cursor.execute("""
+        SELECT
+            id,
+            name,
+            words,
+            is_system,
+            created_at,
+            updated_at
+        FROM word_books
+        ORDER BY
+            is_system DESC,
+            id ASC
     """)
 
-    # -----------------------------------------------------
-    # 导入单词
-    # -----------------------------------------------------
+    rows = cursor.fetchall()
+    active_book = get_active_word_book(cursor)
 
-    for word in words:
+    return [
+        word_book_to_dict(row, active_book["id"])
+        for row in rows
+    ]
+
+
+def set_active_word_book(cursor, book_id):
+
+    cursor.execute("""
+        INSERT OR REPLACE INTO app_meta (key, value)
+        VALUES ('active_word_book_id', ?)
+    """, (str(book_id),))
+
+
+def sync_progress_store(cursor):
+    """把当前词书的学习状态保存到全局进度表。"""
+
+    cursor.execute("""
+        SELECT
+            w.word,
+            p.level,
+            p.last_review,
+            p.next_review,
+            p.correct_count,
+            p.wrong_count,
+            p.learned,
+            p.in_wrong
+        FROM word_progress p
+        INNER JOIN words w
+            ON w.id = p.word_id
+    """)
+
+    for row in cursor.fetchall():
 
         cursor.execute("""
-            INSERT OR REPLACE INTO words (
-                id,
+            INSERT OR REPLACE INTO progress_store (
+                word_key,
                 word,
-                pos,
-                phonetic,
-                meaning,
-                example,
-                example_cn,
-                level
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            word.get("id"),
-            word.get("word"),
-            word.get("pos"),
-            word.get("phonetic"),
-            word.get("meaning"),
-            word.get("example"),
-            word.get("example_cn"),
-            word.get("level")
-        ))
-
-    # -----------------------------------------------------
-    # 导入学习记录
-    # -----------------------------------------------------
-
-    all_word_ids = set()
-
-    all_word_ids.update(learned_ids)
-    all_word_ids.update(wrong_ids)
-
-    for word_id in word_progress.keys():
-
-        try:
-
-            all_word_ids.add(
-                int(word_id)
-            )
-
-        except (ValueError, TypeError):
-
-            continue
-
-    for word_id in all_word_ids:
-
-        key = str(word_id)
-
-        info = word_progress.get(
-            key,
-            {}
-        )
-
-        learned = 1 if word_id in learned_ids else 0
-
-        in_wrong = 1 if word_id in wrong_ids else 0
-
-        cursor.execute("""
-            INSERT OR REPLACE INTO word_progress (
-                word_id,
                 level,
                 last_review,
                 next_review,
@@ -329,77 +648,429 @@ def migrate_json_to_database():
                 learned,
                 in_wrong
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-
-            int(word_id),
-
-            info.get(
-                "level",
-                0
-            ),
-
-            info.get(
-                "last_review"
-            ),
-
-            info.get(
-                "next_review"
-            ),
-
-            info.get(
-                "correct_count",
-                0
-            ),
-
-            max(
-                info.get(
-                    "wrong_count",
-                    0
-                ),
-                1 if in_wrong else 0
-            ),
-
-            learned,
-
-            in_wrong
-
+            normalize_word_key(row["word"]),
+            row["word"],
+            row["level"],
+            row["last_review"],
+            row["next_review"],
+            row["correct_count"],
+            row["wrong_count"],
+            row["learned"],
+            row["in_wrong"]
         ))
 
-    # -----------------------------------------------------
-    # 保存总学习次数
-    # -----------------------------------------------------
 
-    total_studied = progress.get(
-        "total_studied",
-        0
-    )
+def sync_system_wordbook():
 
-    cursor.execute("""
-        INSERT OR REPLACE INTO app_meta (
-            key,
-            value
-        )
-        VALUES ('total_studied', ?)
-    """, (
-        str(total_studied),
-    ))
+    words = read_custom_wordlist()
+    words_text = serialize_word_list(words)
+    today = date.today().isoformat()
 
-    # -----------------------------------------------------
-    # 标记迁移完成
-    # -----------------------------------------------------
+    conn = get_db()
+    cursor = conn.cursor()
 
     cursor.execute("""
-        INSERT OR REPLACE INTO app_meta (
-            key,
-            value
-        )
-        VALUES ('json_migration_done', '1')
+        SELECT id
+        FROM word_books
+        WHERE is_system = 1
+        ORDER BY id
+        LIMIT 1
     """)
 
-    conn.commit()
+    row = cursor.fetchone()
 
+    if row is None:
+
+        cursor.execute("""
+            INSERT INTO word_books (
+                name,
+                words,
+                is_system,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, 1, ?, ?)
+        """, (
+            "高考3500词",
+            words_text,
+            today,
+            today
+        ))
+
+        book_id = cursor.lastrowid
+
+    else:
+
+        book_id = row["id"]
+
+        cursor.execute("""
+            UPDATE word_books
+            SET words = ?, updated_at = ?
+            WHERE id = ?
+        """, (
+            words_text,
+            today,
+            book_id
+        ))
+
+    cursor.execute("""
+        SELECT value
+        FROM app_meta
+        WHERE key = 'active_word_book_id'
+    """)
+
+    active_row = cursor.fetchone()
+
+    if active_row is None:
+
+        set_active_word_book(cursor, book_id)
+
+    conn.commit()
     conn.close()
+
+    return book_id
+
+
+ECDICT_MATCH_CACHE = {}
+ECDICT_CACHE_SOURCE = None
+
+
+def load_ecdict_matches(words):
+
+    global ECDICT_CACHE_SOURCE
+
+    if not ECDICT_CSV_FILE.exists():
+        raise FileNotFoundError(
+            f"找不到 ECDICT 数据文件：{ECDICT_CSV_FILE}"
+        )
+
+    stat = ECDICT_CSV_FILE.stat()
+    source = (stat.st_size, stat.st_mtime_ns)
+
+    if source != ECDICT_CACHE_SOURCE:
+
+        ECDICT_MATCH_CACHE.clear()
+        ECDICT_CACHE_SOURCE = source
+
+    missing_words = [
+        word
+        for word in words
+        if word not in ECDICT_MATCH_CACHE
+    ]
+
+    if missing_words:
+
+        target_keys = {}
+
+        for word in missing_words:
+
+            for key in word_lookup_keys(word):
+
+                target_keys.setdefault(key, set()).add(word)
+
+        matches = {}
+
+        with open(
+            ECDICT_CSV_FILE,
+            "r",
+            encoding="utf-8",
+            newline=""
+        ) as handle:
+
+            reader = csv.DictReader(handle)
+
+            for row in reader:
+
+                row_word = row.get("word", "")
+                exact_key = normalize_word_key(row_word)
+                compact_key = compact_word_key(row_word)
+
+                candidates = set()
+
+                candidates.update(
+                    target_keys.get(exact_key, ())
+                )
+
+                if compact_key != exact_key:
+
+                    candidates.update(
+                        target_keys.get(compact_key, ())
+                    )
+
+                for custom_word in candidates:
+
+                    score = ecdict_match_score(custom_word, row)
+                    current = matches.get(custom_word)
+
+                    if current is None or score > current[0]:
+
+                        matches[custom_word] = (score, row)
+
+        for word in missing_words:
+
+            result = matches.get(word)
+
+            ECDICT_MATCH_CACHE[word] = (
+                result[1]
+                if result is not None
+                else None
+            )
+
+    return {
+        word: ECDICT_MATCH_CACHE.get(word)
+        for word in words
+    }
+
+
+def get_ecdict_import_signature(book_id, words):
+
+    stat = ECDICT_CSV_FILE.stat()
+    wordlist_digest = hashlib.sha256(
+        serialize_word_list(words).encode("utf-8")
+    ).hexdigest()
+
+    return (
+        f"{book_id}:"
+        f"{wordlist_digest}:"
+        f"{stat.st_size}:"
+        f"{stat.st_mtime_ns}"
+    )
+
+
+def import_ecdict_words(force=False):
+    """按当前词书重建 words 表，并保留单词对应的学习进度。"""
+
+    conn = get_db()
+    cursor = conn.cursor()
+
+    book = get_active_word_book(cursor)
+    words = normalize_word_list(book["words"])
+
+    if not words:
+        conn.close()
+        raise ValueError(f"词书“{book['name']}”为空")
+
+    signature = get_ecdict_import_signature(book["id"], words)
+
+    cursor.execute("""
+        SELECT value
+        FROM app_meta
+        WHERE key = 'ecdict_import_signature'
+    """)
+
+    signature_row = cursor.fetchone()
+
+    cursor.execute("SELECT COUNT(*) FROM words")
+    current_count = cursor.fetchone()[0]
+
+    if (
+        not force
+        and signature_row
+        and signature_row["value"] == signature
+        and current_count == len(words)
+    ):
+
+        conn.close()
+        return
+
+    matches = load_ecdict_matches(words)
+
+    new_id_by_key = {}
+
+    for index, word in enumerate(words, start=1):
+
+        for key in word_lookup_keys(word):
+
+            new_id_by_key.setdefault(key, index)
+
+    id_map = {}
+
+    cursor.execute("SELECT id, word FROM words")
+    old_word_rows = cursor.fetchall()
+
+    for row in old_word_rows:
+
+        new_id = None
+
+        for key in legacy_word_lookup_keys(row["word"]):
+
+            if key in new_id_by_key:
+
+                new_id = new_id_by_key[key]
+                break
+
+        if new_id is not None:
+
+            id_map[row["id"]] = new_id
+
+    sync_progress_store(cursor)
+
+    stored_progress = {
+        row["word_key"]: row
+        for row in cursor.execute("""
+            SELECT
+                word_key,
+                level,
+                last_review,
+                next_review,
+                correct_count,
+                wrong_count,
+                learned,
+                in_wrong
+            FROM progress_store
+        """)
+    }
+
+    progress_snapshot = []
+
+    for index, word in enumerate(words, start=1):
+
+        stored = stored_progress.get(
+            normalize_word_key(word)
+        )
+
+        if stored is None:
+            continue
+
+        progress_row = dict(stored)
+        progress_row["word_id"] = index
+        progress_snapshot.append(progress_row)
+
+    try:
+
+        cursor.execute("DELETE FROM word_progress")
+        cursor.execute("DELETE FROM words")
+
+        matched_count = 0
+
+        for index, word in enumerate(words, start=1):
+
+            row = matches.get(word)
+
+            if row is None:
+                row = {}
+            else:
+                matched_count += 1
+
+            translation = clean_ecdict_text(row.get("translation"))
+            definition = clean_ecdict_text(row.get("definition"))
+            meaning = translation or definition or "暂无释义"
+            phonetic = clean_ecdict_text(row.get("phonetic"))
+            pos = derive_pos(translation, row.get("pos"))
+
+            cursor.execute("""
+                INSERT INTO words (
+                    id,
+                    word,
+                    pos,
+                    phonetic,
+                    meaning,
+                    example,
+                    example_cn,
+                    level,
+                    definition,
+                    translation,
+                    exchange,
+                    tag,
+                    bnc,
+                    frq,
+                    collins,
+                    oxford,
+                    detail,
+                    audio,
+                    matched_word,
+                    in_ecdict
+                )
+                VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+            """, (
+                index,
+                word,
+                pos,
+                phonetic,
+                meaning,
+                "",
+                "",
+                "高中",
+                definition,
+                translation,
+                clean_ecdict_text(row.get("exchange")),
+                clean_ecdict_text(row.get("tag")),
+                to_int(row.get("bnc")),
+                to_int(row.get("frq")),
+                to_int(row.get("collins")),
+                to_int(row.get("oxford")),
+                clean_ecdict_text(row.get("detail")),
+                clean_ecdict_text(row.get("audio")),
+                clean_ecdict_text(row.get("word")),
+                1 if row else 0
+            ))
+
+        for row in progress_snapshot:
+
+            cursor.execute("""
+                INSERT OR REPLACE INTO word_progress (
+                    word_id,
+                    level,
+                    last_review,
+                    next_review,
+                    correct_count,
+                    wrong_count,
+                    learned,
+                    in_wrong
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                row["word_id"],
+                row["level"],
+                row["last_review"],
+                row["next_review"],
+                row["correct_count"],
+                row["wrong_count"],
+                row["learned"],
+                row["in_wrong"]
+            ))
+
+        for old_id, new_id in id_map.items():
+
+            if old_id == new_id:
+                continue
+
+            cursor.execute("""
+                UPDATE study_log
+                SET word_id = ?
+                WHERE word_id = ?
+            """, (new_id, old_id))
+
+        cursor.execute("""
+            INSERT OR REPLACE INTO app_meta (key, value)
+            VALUES ('ecdict_import_signature', ?)
+        """, (signature,))
+
+        cursor.execute("""
+            INSERT OR REPLACE INTO app_meta (key, value)
+            VALUES ('ecdict_word_count', ?)
+        """, (str(len(words)),))
+
+        conn.commit()
+
+    except Exception:
+
+        conn.rollback()
+        raise
+
+    finally:
+
+        conn.close()
+
+    print(
+        f"ECDICT 导入完成：词书“{book['name']}”，"
+        f"{len(words)} 个单词，匹配 {matched_count} 条词典数据"
+    )
 
 
 # =========================================================
@@ -458,6 +1129,635 @@ def get_words():
     words = get_all_words()
 
     return jsonify(words)
+
+
+# =========================================================
+# 词库：分页、搜索和状态筛选
+# =========================================================
+
+@app.route("/api/library")
+def get_word_library():
+
+    try:
+
+        page = int(
+            request.args.get(
+                "page",
+                1
+            )
+        )
+
+    except (TypeError, ValueError):
+
+        page = 1
+
+    try:
+
+        per_page = int(
+            request.args.get(
+                "per_page",
+                40
+            )
+        )
+
+    except (TypeError, ValueError):
+
+        per_page = 40
+
+    page = max(page, 1)
+
+    per_page = min(
+        max(per_page, 1),
+        100
+    )
+
+    query = request.args.get(
+        "q",
+        ""
+    ).strip()
+
+    status = request.args.get(
+        "status",
+        "all"
+    ).strip()
+
+    if status not in (
+        "all",
+        "new",
+        "learning",
+        "mastered",
+        "wrong"
+    ):
+
+        status = "all"
+
+    where_parts = []
+
+    params = []
+
+    if query:
+
+        like = f"%{query}%"
+
+        where_parts.append("""
+            (
+                LOWER(w.word) LIKE LOWER(?)
+                OR LOWER(COALESCE(w.meaning, '')) LIKE LOWER(?)
+                OR LOWER(COALESCE(w.translation, '')) LIKE LOWER(?)
+                OR LOWER(COALESCE(w.tag, '')) LIKE LOWER(?)
+            )
+        """)
+
+        params.extend([
+            like,
+            like,
+            like,
+            like
+        ])
+
+    if status == "new":
+
+        where_parts.append("p.word_id IS NULL")
+
+    elif status == "learning":
+
+        where_parts.append("""
+            p.word_id IS NOT NULL
+            AND p.in_wrong = 0
+            AND p.level < 3
+        """)
+
+    elif status == "mastered":
+
+        where_parts.append("""
+            p.word_id IS NOT NULL
+            AND p.in_wrong = 0
+            AND p.level >= 3
+        """)
+
+    elif status == "wrong":
+
+        where_parts.append("""
+            p.word_id IS NOT NULL
+            AND p.in_wrong = 1
+        """)
+
+    where_sql = ""
+
+    if where_parts:
+
+        where_sql = "WHERE " + " AND ".join(
+            where_parts
+        )
+
+    base_sql = """
+        FROM words w
+        LEFT JOIN word_progress p
+            ON w.id = p.word_id
+    """
+
+    conn = get_db()
+
+    cursor = conn.cursor()
+
+    cursor.execute(
+        f"SELECT COUNT(*) {base_sql} {where_sql}",
+        params
+    )
+
+    total = cursor.fetchone()[0]
+
+    total_pages = max(
+        (total + per_page - 1) // per_page,
+        1
+    )
+
+    page = min(
+        page,
+        total_pages
+    )
+
+    offset = (page - 1) * per_page
+
+    cursor.execute(
+        f"""
+        SELECT
+            w.id,
+            w.word,
+            w.pos,
+            w.phonetic,
+            COALESCE(NULLIF(w.translation, ''), NULLIF(w.meaning, ''), '') AS meaning,
+            w.definition,
+            w.translation,
+            w.exchange,
+            w.tag,
+            w.bnc,
+            w.frq,
+            w.collins,
+            w.oxford,
+            w.detail,
+            w.audio,
+            w.matched_word,
+            w.in_ecdict,
+            COALESCE(p.level, 0) AS level,
+            COALESCE(p.learned, 0) AS learned,
+            COALESCE(p.in_wrong, 0) AS in_wrong,
+            COALESCE(p.correct_count, 0) AS correct_count,
+            COALESCE(p.wrong_count, 0) AS wrong_count,
+            p.next_review,
+            CASE
+                WHEN p.word_id IS NULL THEN 'new'
+                WHEN p.in_wrong = 1 THEN 'wrong'
+                WHEN p.level >= 3 THEN 'mastered'
+                ELSE 'learning'
+            END AS progress_status
+        {base_sql}
+        {where_sql}
+        ORDER BY w.id
+        LIMIT ? OFFSET ?
+        """,
+        params + [per_page, offset]
+    )
+
+    rows = cursor.fetchall()
+
+    active_book = get_active_word_book(cursor)
+
+    wordbook = word_book_to_dict(
+        active_book,
+        active_book["id"]
+    )
+
+    wordbooks = list_word_books(cursor)
+
+    conn.close()
+
+    words = []
+
+    for row in rows:
+
+        item = dict(row)
+
+        for field in (
+            "meaning",
+            "definition",
+            "translation",
+            "detail"
+        ):
+
+            item[field] = clean_ecdict_text(
+                item.get(field)
+            )
+
+        words.append(item)
+
+    return jsonify({
+
+        "success": True,
+
+        "words": words,
+
+        "total": total,
+
+        "page": page,
+
+        "per_page": per_page,
+
+        "pages": total_pages,
+
+        "query": query,
+
+        "status": status,
+
+        "wordbook": wordbook,
+
+        "wordbooks": wordbooks
+
+    })
+
+
+# =========================================================
+# 自定义词书管理
+# =========================================================
+
+MAX_WORD_BOOK_SIZE = 20000
+
+
+@app.route("/api/wordbooks")
+def get_word_books():
+
+    conn = get_db()
+    cursor = conn.cursor()
+
+    wordbooks = list_word_books(cursor)
+
+    conn.close()
+
+    return jsonify({
+
+        "success": True,
+
+        "wordbooks": wordbooks
+
+    })
+
+
+@app.route("/api/wordbooks", methods=["POST"])
+def create_word_book():
+
+    data = request.get_json(silent=True) or {}
+
+    name = str(data.get("name", "")).strip()
+    raw_words = data.get("words", "")
+
+    if not name:
+
+        return jsonify({
+            "success": False,
+            "message": "请输入词书名称"
+        }), 400
+
+    if len(name) > 40:
+
+        return jsonify({
+            "success": False,
+            "message": "词书名称不能超过 40 个字符"
+        }), 400
+
+    try:
+
+        words = normalize_word_list(
+            raw_words,
+            MAX_WORD_BOOK_SIZE
+        )
+
+    except ValueError as error:
+
+        return jsonify({
+            "success": False,
+            "message": str(error)
+        }), 400
+
+    if not words:
+
+        return jsonify({
+            "success": False,
+            "message": "词书至少需要一个单词"
+        }), 400
+
+    today = date.today().isoformat()
+
+    conn = get_db()
+    cursor = conn.cursor()
+
+    try:
+
+        cursor.execute("""
+            INSERT INTO word_books (
+                name,
+                words,
+                is_system,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, 0, ?, ?)
+        """, (
+            name,
+            serialize_word_list(words),
+            today,
+            today
+        ))
+
+        book_id = cursor.lastrowid
+
+        set_active_word_book(cursor, book_id)
+
+        conn.commit()
+
+    except sqlite3.IntegrityError:
+
+        conn.rollback()
+        conn.close()
+
+        return jsonify({
+            "success": False,
+            "message": "这个词书名称已经存在"
+        }), 409
+
+    conn.close()
+
+    import_ecdict_words(force=True)
+
+    conn = get_db()
+    cursor = conn.cursor()
+    book = get_word_book(cursor, book_id)
+    wordbook = word_book_to_dict(book, book_id)
+    conn.close()
+
+    return jsonify({
+
+        "success": True,
+
+        "wordbook": wordbook,
+
+        "message": "词书创建成功"
+
+    })
+
+
+@app.route(
+    "/api/wordbooks/<int:book_id>",
+    methods=["GET", "PUT"]
+)
+def word_book_detail(book_id):
+
+    conn = get_db()
+    cursor = conn.cursor()
+    book = get_word_book(cursor, book_id)
+
+    if book is None:
+
+        conn.close()
+
+        return jsonify({
+            "success": False,
+            "message": "找不到这个词书"
+        }), 404
+
+    if request.method == "GET":
+
+        active_book = get_active_word_book(cursor)
+        result = word_book_to_dict(
+            book,
+            active_book["id"],
+            include_words=True
+        )
+
+        conn.close()
+
+        return jsonify({
+            "success": True,
+            "wordbook": result
+        })
+
+    if book["is_system"]:
+
+        conn.close()
+
+        return jsonify({
+            "success": False,
+            "message": "默认词书请直接编辑 03_data/wordlist.txt"
+        }), 400
+
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", "")).strip()
+    raw_words = data.get("words", "")
+
+    if not name:
+
+        conn.close()
+
+        return jsonify({
+            "success": False,
+            "message": "请输入词书名称"
+        }), 400
+
+    if len(name) > 40:
+
+        conn.close()
+
+        return jsonify({
+            "success": False,
+            "message": "词书名称不能超过 40 个字符"
+        }), 400
+
+    try:
+
+        words = normalize_word_list(
+            raw_words,
+            MAX_WORD_BOOK_SIZE
+        )
+
+    except ValueError as error:
+
+        conn.close()
+
+        return jsonify({
+            "success": False,
+            "message": str(error)
+        }), 400
+
+    if not words:
+
+        conn.close()
+
+        return jsonify({
+            "success": False,
+            "message": "词书至少需要一个单词"
+        }), 400
+
+    active_book = get_active_word_book(cursor)
+    is_active = active_book["id"] == book_id
+
+    try:
+
+        cursor.execute("""
+            UPDATE word_books
+            SET name = ?, words = ?, updated_at = ?
+            WHERE id = ?
+        """, (
+            name,
+            serialize_word_list(words),
+            date.today().isoformat(),
+            book_id
+        ))
+
+        conn.commit()
+
+    except sqlite3.IntegrityError:
+
+        conn.rollback()
+        conn.close()
+
+        return jsonify({
+            "success": False,
+            "message": "这个词书名称已经存在"
+        }), 409
+
+    conn.close()
+
+    if is_active:
+
+        import_ecdict_words(force=True)
+
+    conn = get_db()
+    cursor = conn.cursor()
+    book = get_word_book(cursor, book_id)
+    wordbook = word_book_to_dict(
+        book,
+        book_id if is_active else active_book["id"]
+    )
+    conn.close()
+
+    return jsonify({
+
+        "success": True,
+
+        "wordbook": wordbook,
+
+        "message": "词书已更新"
+
+    })
+
+
+@app.route(
+    "/api/wordbooks/<int:book_id>/activate",
+    methods=["POST"]
+)
+def activate_word_book(book_id):
+
+    conn = get_db()
+    cursor = conn.cursor()
+    book = get_word_book(cursor, book_id)
+
+    if book is None:
+
+        conn.close()
+
+        return jsonify({
+            "success": False,
+            "message": "找不到这个词书"
+        }), 404
+
+    set_active_word_book(cursor, book_id)
+    conn.commit()
+    conn.close()
+
+    import_ecdict_words(force=True)
+
+    conn = get_db()
+    cursor = conn.cursor()
+    book = get_word_book(cursor, book_id)
+    wordbook = word_book_to_dict(book, book_id)
+    conn.close()
+
+    return jsonify({
+
+        "success": True,
+
+        "wordbook": wordbook,
+
+        "message": f"已切换到“{wordbook['name']}”"
+
+    })
+
+
+@app.route(
+    "/api/wordbooks/<int:book_id>",
+    methods=["DELETE"]
+)
+def delete_word_book(book_id):
+
+    conn = get_db()
+    cursor = conn.cursor()
+    book = get_word_book(cursor, book_id)
+
+    if book is None:
+
+        conn.close()
+
+        return jsonify({
+            "success": False,
+            "message": "找不到这个词书"
+        }), 404
+
+    if book["is_system"]:
+
+        conn.close()
+
+        return jsonify({
+            "success": False,
+            "message": "默认词书不能删除"
+        }), 400
+
+    active_book = get_active_word_book(cursor)
+    was_active = active_book["id"] == book_id
+
+    cursor.execute("""
+        DELETE FROM word_books
+        WHERE id = ?
+    """, (book_id,))
+
+    if was_active:
+
+        cursor.execute("""
+            SELECT id
+            FROM word_books
+            WHERE is_system = 1
+            ORDER BY id
+            LIMIT 1
+        """)
+
+        system_book = cursor.fetchone()
+
+        if system_book is not None:
+
+            set_active_word_book(cursor, system_book["id"])
+
+    conn.commit()
+    conn.close()
+
+    if was_active:
+
+        import_ecdict_words(force=True)
+
+    return jsonify({
+
+        "success": True,
+
+        "message": "词书已删除"
+
+    })
 
 
 # =========================================================
@@ -1160,14 +2460,16 @@ def record_word():
 
     # 检查单词是否存在
     cursor.execute("""
-        SELECT id
+        SELECT id, word
         FROM words
         WHERE id = ?
     """, (
         word_id,
     ))
 
-    if cursor.fetchone() is None:
+    word_row = cursor.fetchone()
+
+    if word_row is None:
 
         conn.close()
 
@@ -1179,6 +2481,8 @@ def record_word():
                 "找不到这个单词"
 
         }), 404
+
+    word_text = word_row["word"]
 
     # 查询现有进度
     cursor.execute("""
@@ -1334,6 +2638,32 @@ def record_word():
         in_wrong
 
     ))
+
+    cursor.execute("""
+        INSERT OR REPLACE INTO progress_store (
+            word_key,
+            word,
+            level,
+            last_review,
+            next_review,
+            correct_count,
+            wrong_count,
+            learned,
+            in_wrong
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        normalize_word_key(word_text),
+        word_text,
+        level,
+        last_review,
+        next_review,
+        correct_count,
+        wrong_count,
+        learned,
+        in_wrong
+    ))
+
     # =====================================================
     # 保存学习日志
     # =====================================================
@@ -1548,6 +2878,9 @@ def reset_progress():
         DELETE FROM word_progress
     """)
     cursor.execute("""
+        DELETE FROM progress_store
+    """)
+    cursor.execute("""
         DELETE FROM study_log
     """)
     # 总学习次数归零
@@ -1663,9 +2996,9 @@ if __name__ == "__main__":
     # 创建数据库
     init_database()
 
-    # 第一次启动时：
-    # 把当前 JSON 数据完整迁移进 SQLite
-    migrate_json_to_database()
+    # 同步默认词书并导入当前词书
+    sync_system_wordbook()
+    import_ecdict_words()
 
     # 启动 Flask
     app.run(debug=True)
